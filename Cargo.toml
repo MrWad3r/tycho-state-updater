@@ -1,0 +1,12 @@
+[package]
+name = "tycho-state-updater"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+memmap2 = "0.9.10"
+thiserror = "2.0.18"
+ton_block = { git = "https://github.com/broxus/ton-labs-block.git" }
+ton_types = { git = "https://github.com/broxus/ton-labs-types.git" }
+tycho-types = { git = "https://github.com/broxus/tycho-types.git", features = ["tycho"] }
