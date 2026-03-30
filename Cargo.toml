@@ -5,8 +5,20 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+broxus-util = { version = "0.2.7", features = ["public-ip"] }
+clap = { version = "4.6.0", features = ["derive"] }
+everscale-crypto = "0.2.1"
+everscale-network = "0.5.5"
+futures = "0.3.32"
+global-config = { git = "https://github.com/broxus/ton-indexer.git", version = "0.1.0" }
+hex = "0.4.3"
 memmap2 = "0.9.10"
+rand = "0.10.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 thiserror = "2.0.18"
+tl-proto = { version = "0.4.12", features = ["derive"] }
+tokio = { version = "1.50.0", features = ["full"] }
 ton_block = { git = "https://github.com/broxus/ton-labs-block.git" }
 ton_types = { git = "https://github.com/broxus/ton-labs-types.git" }
 tycho-types = { git = "https://github.com/broxus/tycho-types.git", features = ["tycho"] }

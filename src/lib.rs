@@ -26,7 +26,6 @@ pub enum MigrationError {
     Tycho(#[from] TychoError),
 }
 
-
 pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::ShardStateUnsplit> {
     let accounts = map_shard_accounts(&old_state.read_accounts()?)?;
 
@@ -62,18 +61,18 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
     })
 }
 
-/// Migrates an old shard state BOC into a `tycho-types` shard state.
+
 pub fn migrate_boc(bytes: &[u8]) -> Result<tycho::ShardStateUnsplit> {
     let old_state = ton_block::ShardStateUnsplit::construct_from_bytes(bytes)?;
     migrate_state(&old_state)
 }
 
-/// Migrates an old shard state BOC into the `tycho-types` BOC representation.
+
 pub fn migrate_boc_to_boc(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(BocRepr::encode(migrate_boc(bytes)?)?)
 }
 
-/// Migrates an old shard state from a BOC file using mmap input.
+
 pub fn migrate_file(path: impl AsRef<Path>) -> Result<tycho::ShardStateUnsplit> {
     let file = File::open(path.as_ref())?;
     // SAFETY: The file is opened read-only and the mapping does not outlive it.
@@ -81,7 +80,7 @@ pub fn migrate_file(path: impl AsRef<Path>) -> Result<tycho::ShardStateUnsplit> 
     migrate_boc(&bytes)
 }
 
-/// Migrates an old shard state file into the `tycho-types` BOC representation.
+
 pub fn migrate_file_to_boc(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     let file = File::open(path.as_ref())?;
     // SAFETY: The file is opened read-only and the mapping does not outlive it.
@@ -267,11 +266,7 @@ fn map_shard_accounts(old_accounts: &ton_block::ShardAccounts) -> Result<tycho::
     let mut accounts = tycho::ShardAccounts::new();
     old_accounts.iterate_with_keys(|account_id: ton_types::UInt256, old_shard_account| {
         let (depth_balance_info, shard_account) = map_shard_account(&old_shard_account)?;
-        accounts.set(
-            convert_hash(&account_id),
-            depth_balance_info,
-            shard_account,
-        )?;
+        accounts.set(convert_hash(&account_id), depth_balance_info, shard_account)?;
         Ok(true)
     })?;
     Ok(accounts)
