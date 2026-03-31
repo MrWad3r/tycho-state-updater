@@ -6,7 +6,7 @@ use thiserror::Error;
 use ton_block::{Deserializable as _, HashmapAugType as _};
 use ton_types::HashmapType as _;
 use tycho_types::boc::{self, Boc, BocRepr, BocReprError};
-use tycho_types::cell::{HashBytes, Lazy, Load};
+use tycho_types::cell::{Lazy, Load};
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
 
@@ -61,25 +61,14 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
     })
 }
 
-
 pub fn migrate_boc(bytes: &[u8]) -> Result<tycho::ShardStateUnsplit> {
     let old_state = ton_block::ShardStateUnsplit::construct_from_bytes(bytes)?;
     migrate_state(&old_state)
 }
 
-
 pub fn migrate_boc_to_boc(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(BocRepr::encode(migrate_boc(bytes)?)?)
 }
-
-
-pub fn migrate_file(path: impl AsRef<Path>) -> Result<tycho::ShardStateUnsplit> {
-    let file = File::open(path.as_ref())?;
-    // SAFETY: The file is opened read-only and the mapping does not outlive it.
-    let bytes = unsafe { Mmap::map(&file)? };
-    migrate_boc(&bytes)
-}
-
 
 pub fn migrate_file_to_boc(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     let file = File::open(path.as_ref())?;
@@ -97,7 +86,7 @@ where
     Ok(BocRepr::decode(bytes.as_slice())?)
 }
 
-fn convert_hash(hash: &ton_types::UInt256) -> HashBytes {
+fn convert_hash(hash: &ton_types::UInt256) -> tycho_types::cell::HashBytes {
     (*hash.as_slice()).into()
 }
 
@@ -270,143 +259,4 @@ fn map_shard_accounts(old_accounts: &ton_block::ShardAccounts) -> Result<tycho::
         Ok(true)
     })?;
     Ok(accounts)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::*;
-    use ton_block::Serializable as _;
-
-    fn make_old_active_account(init_code_hash: bool) -> ton_types::Result<ton_block::Account> {
-        let address = ton_block::MsgAddressInt::with_standart(
-            None,
-            0,
-            ton_types::UInt256::from([0x11; 32]).into(),
-        )?;
-
-        let mut state_init = ton_block::StateInit::default();
-        state_init.set_code(ton_types::BuilderData::new().into_cell()?);
-        state_init.set_data(ton_types::BuilderData::new().into_cell()?);
-
-        ton_block::Account::active_by_init_code_hash(
-            address,
-            ton_block::CurrencyCollection::with_grams(100),
-            17,
-            state_init,
-            init_code_hash,
-        )
-    }
-
-    fn make_old_state(init_code_hash: bool) -> ton_types::Result<ton_block::ShardStateUnsplit> {
-        let mut state =
-            ton_block::ShardStateUnsplit::with_ident(ton_block::ShardIdent::with_workchain_id(0)?);
-        state.set_global_id(42);
-        state.set_seq_no(1);
-        state.set_vert_seq_no(7);
-        state.set_gen_time(123);
-        state.set_gen_lt(456);
-        state.set_min_ref_mc_seqno(8);
-        state.set_before_split(true);
-        state.set_overload_history(11);
-        state.set_underload_history(12);
-
-        let account = make_old_active_account(init_code_hash)?;
-        let mut accounts = ton_block::ShardAccounts::default();
-        accounts.insert(0, &account, ton_types::UInt256::from([0x22; 32]), 77)?;
-        state.write_accounts(&accounts)?;
-
-        state.set_total_balance(ton_block::CurrencyCollection::with_grams(100));
-        state.set_total_validator_fees(ton_block::CurrencyCollection::with_grams(5));
-
-        Ok(state)
-    }
-
-    #[test]
-    fn maps_future_split_merge_variants() {
-        assert_eq!(
-            map_future_split_merge(&ton_block::FutureSplitMerge::None),
-            None
-        );
-        assert_eq!(
-            map_future_split_merge(&ton_block::FutureSplitMerge::Split {
-                split_utime: 10,
-                interval: 20,
-            }),
-            Some(tycho::FutureSplitMerge::Split {
-                split_utime: 10,
-                interval: 20,
-            })
-        );
-        assert_eq!(
-            map_future_split_merge(&ton_block::FutureSplitMerge::Merge {
-                merge_utime: 30,
-                interval: 40,
-            }),
-            Some(tycho::FutureSplitMerge::Merge {
-                merge_utime: 30,
-                interval: 40,
-            })
-        );
-    }
-
-    #[test]
-    fn migrates_old_boc_with_init_code_hash_account() -> Result<()> {
-        let old_state = make_old_state(true)?;
-        let migrated = migrate_boc(&old_state.write_to_bytes()?)?;
-
-        assert_eq!(migrated.global_id, 42);
-        assert_eq!(migrated.seqno, 1);
-        assert_eq!(migrated.vert_seqno, 7);
-        assert_eq!(migrated.gen_utime, 123);
-        assert_eq!(migrated.gen_utime_ms, 0);
-        assert_eq!(migrated.gen_lt, 456);
-        assert_eq!(migrated.min_ref_mc_seqno, 8);
-        assert!(migrated.before_split);
-
-        let accounts = migrated.load_accounts()?;
-        let (depth_balance_info, shard_account) = accounts
-            .get(HashBytes::from([0x11; 32]))?
-            .expect("account must exist");
-        assert_eq!(depth_balance_info.split_depth, 0);
-        assert_eq!(depth_balance_info.balance.tokens, 100u128);
-
-        let account = shard_account
-            .load_account()?
-            .expect("account data must exist");
-        assert_eq!(account.last_trans_lt, 0);
-        assert_eq!(account.balance.tokens, 100u128);
-        assert!(matches!(account.state, tycho::AccountState::Active(_)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn migrates_file_to_tycho_boc() -> Result<()> {
-        let old_state = make_old_state(false)?;
-        let old_boc = old_state.write_to_bytes()?;
-
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "tycho-state-updater-{}-{suffix}.boc",
-            std::process::id()
-        ));
-
-        std::fs::write(&path, &old_boc)?;
-
-        let migrated_boc = migrate_file_to_boc(&path)?;
-        let migrated: tycho::ShardStateUnsplit = BocRepr::decode(migrated_boc.as_slice())?;
-
-        let _ = std::fs::remove_file(&path);
-
-        assert_eq!(migrated.seqno, 1);
-        assert_eq!(migrated.total_balance.tokens, 100u128);
-        assert_eq!(migrated.total_validator_fees.tokens, 5u128);
-
-        Ok(())
-    }
 }

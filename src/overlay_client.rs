@@ -5,7 +5,7 @@ use anyhow::Result;
 use everscale_network::adnl::{NewPeerContext, NodeIdShort};
 use tl_proto::{TlRead, TlWrite};
 
-use super::CliContext;
+use crate::cli_context::CliContext;
 
 pub async fn resolve_node(
     node_id: &NodeIdShort,

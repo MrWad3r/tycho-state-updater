@@ -8,9 +8,11 @@ use anyhow::{Context, Result};
 use everscale_network::adnl::NodeIdShort;
 use futures::stream::{FuturesOrdered, StreamExt};
 
+use crate::PersistentStateRequest;
+use crate::cli_context::CliContext;
+
 use super::overlay_client;
 use super::tl_models::{PreparedState, RpcDownloadPersistentStateSlice, RpcPreparePersistentState};
-use super::{CliContext, PersistentStateRequest};
 
 const MAX_RLDP_SIZE: u64 = 2_000_000;
 const BATCH_SIZE: usize = 10;
