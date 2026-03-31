@@ -1,8 +1,10 @@
 use std::fmt::Debug;
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 
 use anyhow::Result;
-use everscale_network::adnl::{NewPeerContext, NodeIdShort};
+use everscale_network::adnl::{NewPeerContext, NodeIdFull, NodeIdShort};
+use everscale_network::proto;
 use tl_proto::{TlRead, TlWrite};
 
 use crate::cli_context::CliContext;
@@ -10,11 +12,25 @@ use crate::cli_context::CliContext;
 pub async fn resolve_node(
     node_id: &NodeIdShort,
     ctx: Arc<CliContext>,
-) -> Result<(std::net::SocketAddrV4, NodeIdShort)> {
+) -> Result<(SocketAddrV4, NodeIdShort)> {
     for dht_node in &ctx.global_config.dht_nodes {
         let _ = ctx.dht.add_dht_peer(dht_node.clone());
     }
-    ctx.dht.find_more_dht_nodes().await?;
+
+    if let Some((node_address, node_id_full)) = find_static_peer(node_id, &ctx)? {
+        let target_node_id = node_id_full.compute_short_id();
+        ctx.rldp.adnl().add_peer(
+            NewPeerContext::PublicOverlay,
+            &ctx.local_id,
+            &target_node_id,
+            node_address,
+            node_id_full,
+        )?;
+        return Ok((node_address, target_node_id));
+    }
+
+    let added = ctx.dht.find_more_dht_nodes().await?;
+    println!("added new resolved nodes: {:?}", added);
 
     let (node_address, node_id_full) = ctx.dht.find_address(node_id).await?;
     let target_node_id = node_id_full.compute_short_id();
@@ -77,6 +93,27 @@ where
             Ok((None, _)) => eprintln!("node reply timed out on overlay {overlay_id}"),
             Err(error) => eprintln!("failed to query overlay {overlay_id}: {error:?}"),
         }
+    }
+
+    Ok(None)
+}
+
+fn find_static_peer(
+    node_id: &NodeIdShort,
+    ctx: &CliContext,
+) -> Result<Option<(SocketAddrV4, NodeIdFull)>> {
+    for dht_node in &ctx.global_config.dht_nodes {
+        let node_id_full = NodeIdFull::try_from(dht_node.id.as_equivalent_ref())?;
+        //println!("{}", node_id_full.compute_short_id());
+        if node_id_full.compute_short_id() != *node_id {
+            continue;
+        }
+
+        let Some(address) = dht_node.addr_list.address else {
+            continue;
+        };
+
+        return Ok(Some((proto::adnl::Address::into(address), node_id_full)));
     }
 
     Ok(None)
