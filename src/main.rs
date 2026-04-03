@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use broxus_util::serde_hex_array;
 use clap::{Parser, Subcommand};
-use everscale_network::adnl::NodeIdShort;
 use serde::{Deserialize, Deserializer};
 use ton_block::{BlockIdExt, ShardIdent};
 use ton_types::UInt256;
@@ -33,8 +32,8 @@ enum Command {
 struct DownloadStateArgs {
     #[arg(long = "global-config", short = 'g')]
     global_config: PathBuf,
-    #[arg(long = "node-id")]
-    node_id: String,
+    #[arg(long = "node-id", hide = true)]
+    _node_id: Option<String>,
     #[arg(long = "block")]
     block: String,
     #[arg(long = "masterchain-block", alias = "m-block")]
@@ -102,14 +101,6 @@ async fn main() -> Result<()> {
         Command::DownloadState(args) => args.run().await,
         Command::Migrate(args) => args.run(),
     }
-}
-
-fn decode_node_id(node_id: &str) -> Result<NodeIdShort> {
-    let bytes = hex::decode(node_id).context("node id must be hex")?;
-    let hash: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("node id must decode to exactly 32 bytes"))?;
-    Ok(NodeIdShort::new(hash))
 }
 
 fn deserialize_hex_number<'de, D>(deserializer: D) -> Result<u64, D::Error>

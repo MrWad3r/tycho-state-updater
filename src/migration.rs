@@ -29,6 +29,7 @@ pub enum MigrationError {
 pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::ShardStateUnsplit> {
     let accounts = map_shard_accounts(&old_state.read_accounts()?)?;
 
+
     let custom = match old_state.read_custom()? {
         Some(custom) => {
             let custom = map_mc_state_extra(&custom)?;
@@ -63,6 +64,7 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
 
 pub fn migrate_boc(bytes: &[u8]) -> Result<tycho::ShardStateUnsplit> {
     let old_state = ton_block::ShardStateUnsplit::construct_from_bytes(bytes)?;
+    println!("Migrating Everscale shard state {}", old_state.id());
     migrate_state(&old_state)
 }
 
@@ -253,10 +255,14 @@ fn map_shard_account(
 
 fn map_shard_accounts(old_accounts: &ton_block::ShardAccounts) -> Result<tycho::ShardAccounts> {
     let mut accounts = tycho::ShardAccounts::new();
+    let mut total_account = 0u32;
+    println!("Converting accounts...");
     old_accounts.iterate_with_keys(|account_id: ton_types::UInt256, old_shard_account| {
         let (depth_balance_info, shard_account) = map_shard_account(&old_shard_account)?;
         accounts.set(convert_hash(&account_id), depth_balance_info, shard_account)?;
+        total_account += 1;
         Ok(true)
     })?;
+    println!("Total accounts converted: {}", total_account);
     Ok(accounts)
 }

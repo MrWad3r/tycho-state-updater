@@ -6,13 +6,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use everscale_network::adnl::NodeIdShort;
+use everscale_network::overlay;
 use futures::stream::{FuturesOrdered, StreamExt};
 
 use crate::PersistentStateRequest;
 use crate::cli_context::CliContext;
 
 use super::overlay_client;
-use super::tl_models::{PreparedState, RpcDownloadPersistentStateSlice, RpcPreparePersistentState};
+use super::tl_models::RpcDownloadPersistentStateSlice;
 
 const MAX_RLDP_SIZE: u64 = 2_000_000;
 const BATCH_SIZE: usize = 10;
@@ -20,38 +21,25 @@ const BATCH_CAPACITY: usize = MAX_RLDP_SIZE as usize * BATCH_SIZE;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub async fn prepare_persistent_state(
-    node_id: &NodeIdShort,
     request: &PersistentStateRequest,
     ctx: Arc<CliContext>,
-) -> Result<bool> {
-    let reply = overlay_client::adnl_query_node::<RpcPreparePersistentState, PreparedState>(
-        node_id,
-        RpcPreparePersistentState {
-            block: request.block.clone(),
-            masterchain_block: request.masterchain_block.clone(),
-        },
-        ctx,
-    )
-    .await?;
-
-    match reply {
-        Some(PreparedState::Found) => Ok(true),
-        Some(PreparedState::NotFound) => Ok(false),
-        None => anyhow::bail!("failed to get `preparePersistentState` response from node"),
-    }
+) -> Result<Vec<overlay_client::PersistentStatePeer>> {
+    overlay_client::find_persistent_state_peers(&request.block, &request.masterchain_block, ctx)
+        .await
 }
 
 pub async fn download_persistent_state(
-    node_id: &NodeIdShort,
+    peers: Vec<overlay_client::PersistentStatePeer>,
     request: &PersistentStateRequest,
     output_file_path: Option<&Path>,
     ctx: Arc<CliContext>,
 ) -> Result<()> {
+    let mut peers = peers;
     let mut writer = open_output(output_file_path)?;
     let mut offset = 0u64;
     loop {
-        let bytes = download_batch_with_retry(
-            node_id,
+        let bytes = download_batch_with_failover(
+            &mut peers,
             &request.block,
             &request.masterchain_block,
             offset,
@@ -76,27 +64,48 @@ pub async fn download_persistent_state(
     Ok(())
 }
 
-async fn download_batch_with_retry(
-    node_id: &NodeIdShort,
+async fn download_batch_with_failover(
+    peers: &mut Vec<overlay_client::PersistentStatePeer>,
     block: &ton_block::BlockIdExt,
     masterchain_block: &ton_block::BlockIdExt,
     start_offset: u64,
     ctx: Arc<CliContext>,
 ) -> Result<Vec<u8>> {
     loop {
-        match download_batch(node_id, block, masterchain_block, start_offset, ctx.clone()).await {
+        let Some(peer) = peers.first().cloned() else {
+            anyhow::bail!("all persistent-state peers failed at offset {start_offset}");
+        };
+
+        match download_batch(
+            &peer.overlay,
+            &peer.peer_id,
+            block,
+            masterchain_block,
+            start_offset,
+            ctx.clone(),
+        )
+        .await
+        {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
-                // Persistent-state downloads can run for hours, so a retry loop must not spin
-                // aggressively on transient network failures.
-                println!("batch download failed at offset {start_offset}: {error}");
-                tokio::time::sleep(RETRY_DELAY).await;
+                println!(
+                    "batch download failed at offset {start_offset} on peer {}: {error}",
+                    peer.peer_id
+                );
+                peers.remove(0);
+
+                if let Some(next_peer) = peers.first() {
+                    println!("switching to peer {}", next_peer.peer_id);
+                } else {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
             }
         }
     }
 }
 
 async fn download_batch(
+    overlay: &Arc<overlay::Overlay>,
     node_id: &NodeIdShort,
     block: &ton_block::BlockIdExt,
     masterchain_block: &ton_block::BlockIdExt,
@@ -113,7 +122,8 @@ async fn download_batch(
         futures.push_back(async move {
             let offset = chunk_offset(start_offset, index);
             println!("downloading offset {offset}");
-            overlay_client::rldp_query_node_raw(
+            let result = overlay_client::rldp_query_node_raw_in_overlay(
+                overlay,
                 &node_id,
                 RpcDownloadPersistentStateSlice {
                     block,
@@ -123,24 +133,39 @@ async fn download_batch(
                 },
                 ctx,
             )
-            .await
+            .await;
+            (offset, result)
         });
     }
 
     let mut merged = Vec::with_capacity(BATCH_CAPACITY);
-    let mut saw_short_chunk = false;
+    let mut eof_offset = None;
+    let mut trailing_empty_chunks = 0usize;
 
     while let Some(chunk) = futures.next().await {
+        let (offset, chunk) = chunk;
         match chunk? {
             Some(bytes) => {
                 if bytes.len() < MAX_RLDP_SIZE as usize {
-                    saw_short_chunk = true;
+                    eof_offset = Some(
+                        offset
+                            + u64::try_from(bytes.len())
+                                .context("slice size does not fit into u64")?,
+                    );
                 }
                 merged.extend_from_slice(bytes.as_slice());
             }
-            None if saw_short_chunk => {}
-            None => anyhow::bail!("node returned an empty slice before EOF"),
+            None if eof_offset.is_some() => {
+                trailing_empty_chunks += 1;
+            }
+            None => anyhow::bail!("node returned an empty slice before EOF at offset {offset}"),
         }
+    }
+
+    if let Some(eof_offset) = eof_offset.filter(|_| trailing_empty_chunks > 0) {
+        println!(
+            "ignoring {trailing_empty_chunks} trailing empty replies after EOF at offset {eof_offset}"
+        );
     }
 
     Ok(merged)
