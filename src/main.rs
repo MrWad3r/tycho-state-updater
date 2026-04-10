@@ -32,8 +32,6 @@ enum Command {
 struct DownloadStateArgs {
     #[arg(long = "global-config", short = 'g')]
     global_config: PathBuf,
-    #[arg(long = "node-id", hide = true)]
-    _node_id: Option<String>,
     #[arg(long = "block")]
     block: String,
     #[arg(long = "masterchain-block", alias = "m-block")]
@@ -49,6 +47,8 @@ struct MigrateArgs {
     input: PathBuf,
     #[arg(long = "output", short = 'o')]
     output: PathBuf,
+    #[arg(long = "current-validator-set")]
+    current_validator_set: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

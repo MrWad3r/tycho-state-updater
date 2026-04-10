@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -9,6 +10,7 @@ use tycho_types::boc::{self, Boc, BocRepr, BocReprError};
 use tycho_types::cell::{Lazy, Load};
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
+use tycho_types::models::BlockchainConfigParams;
 
 pub type Result<T> = std::result::Result<T, MigrationError>;
 
@@ -27,16 +29,14 @@ pub enum MigrationError {
 }
 
 pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::ShardStateUnsplit> {
+    let custom = old_state
+        .read_custom()?
+        .map(|custom| map_mc_state_extra(&custom, old_state.global_id()))
+        .transpose()?
+        .map(|custom| Lazy::new(&custom))
+        .transpose()?;
+
     let accounts = map_shard_accounts(&old_state.read_accounts()?)?;
-
-
-    let custom = match old_state.read_custom()? {
-        Some(custom) => {
-            let custom = map_mc_state_extra(&custom)?;
-            Some(Lazy::new(&custom)?)
-        }
-        None => None,
-    };
 
     Ok(tycho::ShardStateUnsplit {
         global_id: old_state.global_id(),
@@ -68,15 +68,11 @@ pub fn migrate_boc(bytes: &[u8]) -> Result<tycho::ShardStateUnsplit> {
     migrate_state(&old_state)
 }
 
-pub fn migrate_boc_to_boc(bytes: &[u8]) -> Result<Vec<u8>> {
-    Ok(BocRepr::encode(migrate_boc(bytes)?)?)
-}
-
-pub fn migrate_file_to_boc(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+pub fn migrate_file(path: impl AsRef<Path>) -> Result<tycho::ShardStateUnsplit> {
     let file = File::open(path.as_ref())?;
     // SAFETY: The file is opened read-only and the mapping does not outlive it.
     let bytes = unsafe { Mmap::map(&file)? };
-    migrate_boc_to_boc(&bytes)
+    migrate_boc(&bytes)
 }
 
 fn convert_via_boc<T, O>(value: &O) -> Result<T>
@@ -173,18 +169,171 @@ fn map_shard_hashes(old_shard_hashes: &ton_block::ShardHashes) -> Result<tycho::
     ))?)
 }
 
-fn map_blockchain_config(old_config: &ton_block::ConfigParams) -> Result<tycho::BlockchainConfig> {
+fn map_blockchain_config(
+    old_config: &ton_block::ConfigParams,
+    global_id: i32,
+) -> Result<tycho::BlockchainConfig> {
     let root = old_config.config_params.data().cloned().unwrap_or_default();
-    Ok(tycho::BlockchainConfig {
-        address: convert_hash(&old_config.config_addr),
-        params: tycho::BlockchainConfigParams::from_raw(convert_old_cell(&root)?),
+    let config_params = ton_block::config_params::ConfigParams::with_root(root);
+    let mut config = tycho::BlockchainConfig::new_empty(convert_hash(&old_config.config_addr));
+    map_blockchain_config_params(&mut config.params, config_params, global_id)?;
+    Ok(config)
+}
+
+fn copy_old_blockchain_config_params(
+    params: &mut BlockchainConfigParams,
+    old_params: &ton_block::ConfigParams,
+) -> Result<()> {
+    let mut old_param_cells = Vec::new();
+    old_params.config_params.iterate_slices(|mut key, value| {
+        let id = u32::construct_from(&mut key)?;
+        if let Some(cell) = value.reference_opt(0) {
+            old_param_cells.push((id, cell));
+        }
+        Ok(true)
+    })?;
+
+    for (id, cell) in old_param_cells {
+        params.set_raw(id, convert_old_cell(&cell)?)?;
+    }
+
+    Ok(())
+}
+
+fn map_legacy_burning_config(owner_addr: &ton_types::UInt256) -> tycho::BurningConfig {
+    tycho::BurningConfig {
+        blackhole_addr: Some(convert_hash(owner_addr)),
+        fee_burn_num: 0,
+        fee_burn_denom: NonZeroU32::MIN,
+    }
+}
+
+fn default_tycho_collation_config() -> Result<tycho::CollationConfig> {
+    let mut group_slots_fractions = tycho_types::dict::Dict::<u16, u8>::new();
+    group_slots_fractions.set(0, 80)?;
+    group_slots_fractions.set(1, 10)?;
+
+    Ok(tycho::CollationConfig {
+        shuffle_mc_validators: true,
+        mc_block_min_interval_ms: 800,
+        mc_block_max_interval_ms: 2400,
+        empty_sc_block_interval_ms: 60_000,
+        max_uncommitted_chain_length: 31,
+        wu_used_to_import_next_anchor: 1_850_000_000,
+        msgs_exec_params: tycho::MsgsExecutionParams {
+            buffer_limit: 10_000,
+            group_limit: 100,
+            group_vert_size: 10,
+            externals_expire_timeout: 58,
+            open_ranges_limit: 20,
+            par_0_int_msgs_count_limit: 100_000,
+            par_0_ext_msgs_count_limit: 10_000_000,
+            group_slots_fractions,
+            range_messages_limit: 10_000,
+        },
+        work_units_params: tycho::WorkUnitsParams {
+            prepare: tycho::WorkUnitsParamsPrepare {
+                fixed_part: 1_000_000,
+                msgs_stats: 0,
+                remaning_msgs_stats: 0,
+                read_ext_msgs: 145,
+                read_int_msgs: 2_785,
+                read_new_msgs: 1_102,
+                add_to_msg_groups: 80,
+            },
+            execute: tycho::WorkUnitsParamsExecute {
+                prepare: 57_000,
+                execute: 9_550,
+                execute_err: 0,
+                execute_delimiter: 1_000,
+                serialize_enqueue: 87,
+                serialize_dequeue: 87,
+                insert_new_msgs: 87,
+                subgroup_size: 16,
+            },
+            finalize: tycho::WorkUnitsParamsFinalize {
+                build_transactions: 177,
+                build_accounts: 275,
+                build_in_msg: 148,
+                build_out_msg: 145,
+                serialize_min: 2_500_000,
+                serialize_accounts: 3_760,
+                serialize_msg: 3_760,
+                state_update_min: 1_000_000,
+                state_update_accounts: 666,
+                state_update_msg: 425,
+                create_diff: 1_340,
+                serialize_diff: 105,
+                apply_diff: 4_531,
+                diff_tail_len: 306,
+            },
+        },
     })
 }
 
-fn map_mc_state_extra(old_mc_state_extra: &ton_block::McStateExtra) -> Result<tycho::McStateExtra> {
+fn default_tycho_consensus_config() -> tycho::ConsensusConfig {
+    tycho::ConsensusConfig {
+        clock_skew_millis: NonZeroU16::new(5 * 1000).unwrap(),
+        payload_batch_bytes: NonZeroU32::new(768 * 1024).unwrap(),
+        _unused: 0,
+        commit_history_rounds: NonZeroU8::new(20).unwrap(),
+        deduplicate_rounds: 140,
+        max_consensus_lag_rounds: NonZeroU16::new(210).unwrap(),
+        payload_buffer_bytes: NonZeroU32::new(50 * 1024 * 1024).unwrap(),
+        broadcast_retry_millis: NonZeroU16::new(150).unwrap(),
+        download_retry_millis: NonZeroU16::new(25).unwrap(),
+        download_peers: NonZeroU8::new(2).unwrap(),
+        min_sign_attempts: NonZeroU8::new(3).unwrap(),
+        download_peer_queries: NonZeroU8::new(10).unwrap(),
+        sync_support_rounds: NonZeroU16::new(840).unwrap(),
+    }
+}
+
+fn default_tycho_size_limits_config() -> tycho::SizeLimitsConfig {
+    tycho::SizeLimitsConfig {
+        max_msg_bits: 1 << 21,
+        max_msg_cells: 1 << 13,
+        max_library_cells: 1000,
+        max_vm_data_depth: 512,
+        max_ext_msg_size: 65535,
+        max_ext_msg_depth: 512,
+        max_acc_state_cells: 1 << 16,
+        max_acc_state_bits: (1 << 16) * 1023,
+        max_acc_public_libraries: 256,
+        defer_out_queue_size_limit: 256,
+    }
+}
+
+fn map_blockchain_config_params(
+    params: &mut BlockchainConfigParams,
+    old_params: ton_block::ConfigParams,
+    global_id: i32,
+) -> Result<()> {
+    copy_old_blockchain_config_params(params, &old_params)?;
+
+    if let Some(ton_block::ConfigParamEnum::ConfigParam5(old_burning)) = old_params.config(5)? {
+        params.set_burning_config(&map_legacy_burning_config(&old_burning.owner_addr))?;
+    }
+
+    params.set_collation_config(&default_tycho_collation_config()?)?;
+
+    params.set_consensus_config(&default_tycho_consensus_config())?;
+    params.set_global_id(global_id)?;
+    params.set_size_limits(&default_tycho_size_limits_config())?;
+
+    params.remove(50)?;
+    params.remove(100)?;
+
+    Ok(())
+}
+
+fn map_mc_state_extra(
+    old_mc_state_extra: &ton_block::McStateExtra,
+    global_id: i32,
+) -> Result<tycho::McStateExtra> {
     Ok(tycho::McStateExtra {
         shards: map_shard_hashes(&old_mc_state_extra.shards)?,
-        config: map_blockchain_config(&old_mc_state_extra.config)?,
+        config: map_blockchain_config(&old_mc_state_extra.config, global_id)?,
         validator_info: convert_via_boc(&old_mc_state_extra.validator_info)?,
         consensus_info: tycho::ConsensusInfo::ZEROSTATE,
         prev_blocks: convert_via_boc(&old_mc_state_extra.prev_blocks)?,
