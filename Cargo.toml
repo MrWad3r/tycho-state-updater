@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+blake3 = "1.8.4"
 broxus-util = { version = "0.2.7", features = ["public-ip"] }
 clap = { version = "4.6.0", features = ["derive"] }
 everscale-crypto = "0.2.0-pre.1"

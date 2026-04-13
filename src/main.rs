@@ -51,6 +51,8 @@ struct MigrateArgs {
     output: PathBuf,
     #[arg(long = "current-validator-set")]
     current_validator_set: Option<PathBuf>,
+    #[arg(long = "zerostate-id-output")]
+    zerostate_id_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
