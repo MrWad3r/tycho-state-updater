@@ -7,7 +7,7 @@ use thiserror::Error;
 use ton_block::{Deserializable as _, HashmapAugType as _};
 use ton_types::HashmapType as _;
 use tycho_types::boc::{self, Boc, BocRepr, BocReprError};
-use tycho_types::cell::{Lazy, Load};
+use tycho_types::cell::{CellBuilder, CellFamily as _, Lazy, Load};
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
 use tycho_types::models::BlockchainConfigParams;
@@ -29,14 +29,38 @@ pub enum MigrationError {
 }
 
 pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::ShardStateUnsplit> {
-    let custom = old_state
-        .read_custom()?
-        .map(|custom| map_mc_state_extra(&custom, old_state.global_id()))
-        .transpose()?
-        .map(|custom| Lazy::new(&custom))
-        .transpose()?;
+    // Convert config first so we can patch the config account and drop the
+    // fully materialized accounts dict before heavyweight mc extra mapping.
+    let (accounts, custom) = {
+        let mut accounts = map_shard_accounts(&old_state.read_accounts()?)?;
+        match old_state.read_custom()? {
+            Some(custom) => {
+                println!("Mapping masterchain config...");
+                let config = map_blockchain_config(&custom.config, old_state.global_id())?;
+                println!("Mapped masterchain config");
 
-    let accounts = map_shard_accounts(&old_state.read_accounts()?)?;
+                update_config_account(&mut accounts, &config)?;
+
+                println!("Serializing accounts before prev_blocks...");
+                let accounts = Lazy::new(&accounts)?;
+                println!("Serialized accounts before prev_blocks");
+
+                println!("Mapping masterchain extra...");
+                let custom = map_mc_state_extra(&custom, config)?;
+                println!("Mapped masterchain extra");
+
+                (accounts, Some(Lazy::new(&custom)?))
+            }
+            None => {
+                println!("Skipping extra since this state does not have it. {}", old_state.seq_no());
+                (Lazy::new(&accounts)?, None)
+            }
+        }
+    };
+
+    println!("Mapping state libraries...");
+    let libraries = map_libraries(old_state.libraries())?;
+    println!("Mapped state libraries");
 
     Ok(tycho::ShardStateUnsplit {
         global_id: old_state.global_id(),
@@ -49,12 +73,12 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
         min_ref_mc_seqno: old_state.min_ref_mc_seqno(),
         processed_upto: Lazy::new(&tycho::ProcessedUptoInfo::default())?, // Old shard states do not contain tycho's processed-up-to data.
         before_split: old_state.before_split(),
-        accounts: Lazy::new(&accounts)?,
+        accounts,
         overload_history: old_state.overload_history(),
         underload_history: old_state.underload_history(),
         total_balance: convert_via_boc(old_state.total_balance())?,
         total_validator_fees: convert_via_boc(old_state.total_validator_fees())?,
-        libraries: convert_via_boc(old_state.libraries())?,
+        libraries,
         master_ref: old_state
             .master_ref()
             .map(|master_ref| map_block_ref(&master_ref.master)),
@@ -173,31 +197,16 @@ fn map_blockchain_config(
     old_config: &ton_block::ConfigParams,
     global_id: i32,
 ) -> Result<tycho::BlockchainConfig> {
-    let root = old_config.config_params.data().cloned().unwrap_or_default();
-    let config_params = ton_block::config_params::ConfigParams::with_root(root);
-    let mut config = tycho::BlockchainConfig::new_empty(convert_hash(&old_config.config_addr));
-    map_blockchain_config_params(&mut config.params, config_params, global_id)?;
+    let address = convert_hash(&old_config.config_addr);
+    let mut config = match old_config.config_params.data() {
+        Some(root) => tycho::BlockchainConfig {
+            address,
+            params: BlockchainConfigParams::from_raw(convert_old_cell(root)?),
+        },
+        None => tycho::BlockchainConfig::new_empty(address),
+    };
+    map_blockchain_config_params(&mut config.params, old_config, global_id)?;
     Ok(config)
-}
-
-fn copy_old_blockchain_config_params(
-    params: &mut BlockchainConfigParams,
-    old_params: &ton_block::ConfigParams,
-) -> Result<()> {
-    let mut old_param_cells = Vec::new();
-    old_params.config_params.iterate_slices(|mut key, value| {
-        let id = u32::construct_from(&mut key)?;
-        if let Some(cell) = value.reference_opt(0) {
-            old_param_cells.push((id, cell));
-        }
-        Ok(true)
-    })?;
-
-    for (id, cell) in old_param_cells {
-        params.set_raw(id, convert_old_cell(&cell)?)?;
-    }
-
-    Ok(())
 }
 
 fn map_legacy_burning_config(owner_addr: &ton_types::UInt256) -> tycho::BurningConfig {
@@ -306,11 +315,9 @@ fn default_tycho_size_limits_config() -> tycho::SizeLimitsConfig {
 
 fn map_blockchain_config_params(
     params: &mut BlockchainConfigParams,
-    old_params: ton_block::ConfigParams,
+    old_params: &ton_block::ConfigParams,
     global_id: i32,
 ) -> Result<()> {
-    copy_old_blockchain_config_params(params, &old_params)?;
-
     if let Some(ton_block::ConfigParamEnum::ConfigParam5(old_burning)) = old_params.config(5)? {
         params.set_burning_config(&map_legacy_burning_config(&old_burning.owner_addr))?;
     }
@@ -327,28 +334,142 @@ fn map_blockchain_config_params(
     Ok(())
 }
 
+fn update_config_account(
+    accounts: &mut tycho::ShardAccounts,
+    config: &tycho::BlockchainConfig,
+) -> Result<()> {
+    println!("Updating config contract data...");
+    let Some(config_root) = config.params.as_dict().root().clone() else {
+        return Err(TychoError::InvalidData.into());
+    };
+
+    let Some((depth_balance, mut shard_account)) = accounts.get(config.address)? else {
+        return Ok(());
+    };
+
+    let Some(mut account) = shard_account.load_account()? else {
+        return Ok(());
+    };
+
+    match &mut account.state {
+        tycho::AccountState::Active(state) => {
+            let mut builder = CellBuilder::new();
+            builder.store_reference(config_root)?;
+
+            if let Some(data) = state.data.take() {
+                let mut data = data.as_slice()?;
+                data.load_reference()?;
+                builder.store_slice(data)?;
+            }
+
+            state.data = Some(builder.build()?);
+        }
+        tycho::AccountState::Uninit | tycho::AccountState::Frozen(..) => return Ok(()),
+    }
+
+    shard_account.account = Lazy::new(&tycho::OptionalAccount(Some(account)))?;
+    accounts.set(config.address, depth_balance, shard_account)?;
+    println!("Config contract was updated!");
+
+    Ok(())
+}
+
+fn map_prev_blocks(
+    old_prev_blocks: &ton_block::OldMcBlocksInfo,
+) -> Result<tycho_types::dict::AugDict<u32, tycho::KeyMaxLt, tycho::KeyBlockRef>> {
+    let Some(root) = old_prev_blocks.data().cloned() else {
+        return Ok(tycho_types::dict::AugDict::new());
+    };
+
+    let root = convert_old_cell(&root)?;
+    let mut slice = root.as_slice()?;
+    let dict = tycho_types::dict::AugDict::load_from_root_ext(
+        &mut slice,
+        tycho_types::cell::Cell::empty_context(),
+    )?;
+    println!("Converted prev blocks");
+    Ok(dict)
+}
+
+fn map_libraries(
+    old_libraries: &ton_block::Libraries,
+) -> Result<tycho_types::dict::Dict<tycho_types::cell::HashBytes, tycho::LibDescr>> {
+    let Some(root) = old_libraries.root().cloned() else {
+        return Ok(tycho_types::dict::Dict::new());
+    };
+
+    let root = convert_old_cell(&root)?;
+    let mut slice = root.as_slice()?;
+    let dict = tycho_types::dict::Dict::load_from_root_ext(
+        &mut slice,
+        tycho_types::cell::Cell::empty_context(),
+    )?;
+    println!("Converted libraries");
+    Ok(dict)
+}
+
 fn map_mc_state_extra(
     old_mc_state_extra: &ton_block::McStateExtra,
-    global_id: i32,
+    config: tycho::BlockchainConfig,
 ) -> Result<tycho::McStateExtra> {
+    println!("MC extra: mapping shards...");
+    let shards = map_shard_hashes(&old_mc_state_extra.shards)?;
+    println!("MC extra: mapped shards");
+
+    println!("MC extra: mapping validator info...");
+    let validator_info = tycho::ValidatorInfo {
+        validator_list_hash_short: old_mc_state_extra.validator_info.validator_list_hash_short,
+        catchain_seqno: old_mc_state_extra.validator_info.catchain_seqno,
+        nx_cc_updated: old_mc_state_extra.validator_info.nx_cc_updated,
+    };
+    println!("MC extra: mapped validator info");
+
+    println!("MC extra: mapping prev blocks...");
+    let prev_blocks = map_prev_blocks(&old_mc_state_extra.prev_blocks)?;
+    println!("MC extra: mapped prev blocks");
+
+    println!("MC extra: mapping block create stats...");
+    let block_create_stats = map_block_create_stats(old_mc_state_extra.block_create_stats.as_ref())?;
+    println!("MC extra: mapped block create stats");
+
+    println!("MC extra: mapping global balance...");
+    let global_balance = convert_via_boc(&old_mc_state_extra.global_balance)?;
+    println!("MC extra: mapped global balance");
+
     Ok(tycho::McStateExtra {
-        shards: map_shard_hashes(&old_mc_state_extra.shards)?,
-        config: map_blockchain_config(&old_mc_state_extra.config, global_id)?,
-        validator_info: convert_via_boc(&old_mc_state_extra.validator_info)?,
+        shards,
+        config,
+        validator_info,
         consensus_info: tycho::ConsensusInfo::ZEROSTATE,
-        prev_blocks: convert_via_boc(&old_mc_state_extra.prev_blocks)?,
+        prev_blocks,
         after_key_block: old_mc_state_extra.after_key_block,
         last_key_block: old_mc_state_extra
             .last_key_block
             .as_ref()
             .map(map_block_ref),
-        block_create_stats: old_mc_state_extra
-            .block_create_stats
-            .as_ref()
-            .map(|block_create_stats| convert_via_boc(&block_create_stats.counters))
-            .transpose()?,
-        global_balance: convert_via_boc(&old_mc_state_extra.global_balance)?,
+        block_create_stats,
+        global_balance,
     })
+}
+
+fn map_block_create_stats(
+    old_block_create_stats: Option<&ton_block::BlockCreateStats>,
+) -> Result<Option<tycho_types::dict::Dict<tycho_types::cell::HashBytes, tycho::CreatorStats>>> {
+    let Some(old_block_create_stats) = old_block_create_stats else {
+        return Ok(None);
+    };
+
+    let Some(root) = old_block_create_stats.counters.root().cloned() else {
+        return Ok(Some(tycho_types::dict::Dict::new()));
+    };
+
+    let root = convert_old_cell(&root)?;
+    let mut slice = root.as_slice()?;
+    let dict = tycho_types::dict::Dict::load_from_root_ext(
+        &mut slice,
+        tycho_types::cell::Cell::empty_context(),
+    )?;
+    Ok(Some(dict))
 }
 
 fn map_account(old_account: &ton_block::Account) -> Result<Option<tycho::Account>> {
