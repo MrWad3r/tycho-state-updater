@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 use std::path::Path;
@@ -7,10 +8,11 @@ use thiserror::Error;
 use ton_block::{Deserializable as _, HashmapAugType as _};
 use ton_types::HashmapType as _;
 use tycho_types::boc::{self, Boc, BocRepr, BocReprError};
-use tycho_types::cell::{CellBuilder, CellFamily as _, Lazy, Load};
+use tycho_types::cell::{CellBuilder, CellFamily as _, HashBytes, Lazy, Load};
+use tycho_types::dict::AugDict;
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
-use tycho_types::models::BlockchainConfigParams;
+use tycho_types::models::{BlockchainConfigParams, ConfigParam34};
 
 pub type Result<T> = std::result::Result<T, MigrationError>;
 
@@ -26,9 +28,31 @@ pub enum MigrationError {
     TychoRepr(#[from] BocReprError),
     #[error("failed to build tycho shard state: {0}")]
     Tycho(#[from] TychoError),
+    #[error(
+        "cannot make hardfork in the past: state_time_ms={state_time_ms}, hardfork_time_ms={hardfork_time_ms}"
+    )]
+    HardforkInPast {
+        state_time_ms: u64,
+        hardfork_time_ms: u64,
+    },
+    #[error("failed to compute validator subset for hardfork state")]
+    ValidatorSubset,
 }
 
-pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::ShardStateUnsplit> {
+#[derive(Debug, Clone)]
+pub struct ShardStateHashesEntry {
+    pub root_hash: HashBytes,
+    pub file_hash: HashBytes,
+}
+
+pub type ShardStateHashes = BTreeMap<tycho::ShardIdent, ShardStateHashesEntry>;
+
+pub fn migrate_state(
+    old_state: &ton_block::ShardStateUnsplit,
+    shard_state_hashes: Option<&ShardStateHashes>,
+    current_validator_set: Option<&tycho::ValidatorSet>,
+    time_ms: Option<u64>,
+) -> Result<tycho::ShardStateUnsplit> {
     // Convert config first so we can patch the config account and drop the
     // fully materialized accounts dict before heavyweight mc extra mapping.
     let (accounts, custom) = {
@@ -36,7 +60,12 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
         match old_state.read_custom()? {
             Some(custom) => {
                 println!("Mapping masterchain config...");
-                let config = map_blockchain_config(&custom.config, old_state.global_id())?;
+                let config = map_blockchain_config(
+                    &custom.config,
+                    old_state.global_id(),
+                    shard_state_hashes,
+                    current_validator_set,
+                )?;
                 println!("Mapped masterchain config");
 
                 update_config_account(&mut accounts, &config)?;
@@ -46,13 +75,16 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
                 println!("Serialized accounts before prev_blocks");
 
                 println!("Mapping masterchain extra...");
-                let custom = map_mc_state_extra(&custom, config)?;
+                let custom = map_mc_state_extra(&custom, config, shard_state_hashes)?;
                 println!("Mapped masterchain extra");
 
                 (accounts, Some(Lazy::new(&custom)?))
             }
             None => {
-                println!("Skipping extra since this state does not have it. {}", old_state.seq_no());
+                println!(
+                    "Skipping extra since this state does not have it. {}",
+                    old_state.seq_no()
+                );
                 (Lazy::new(&accounts)?, None)
             }
         }
@@ -62,7 +94,7 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
     let libraries = map_libraries(old_state.libraries())?;
     println!("Mapped state libraries");
 
-    Ok(tycho::ShardStateUnsplit {
+    let mut state = tycho::ShardStateUnsplit {
         global_id: old_state.global_id(),
         shard_ident: map_shard_ident(old_state.shard())?,
         seqno: old_state.seq_no(),
@@ -83,20 +115,41 @@ pub fn migrate_state(old_state: &ton_block::ShardStateUnsplit) -> Result<tycho::
             .master_ref()
             .map(|master_ref| map_block_ref(&master_ref.master)),
         custom,
-    })
+    };
+
+    if time_ms.is_some() || current_validator_set.is_some() {
+        prepare_hardfork_state(&mut state, shard_state_hashes, time_ms)?;
+    }
+
+    Ok(state)
 }
 
-pub fn migrate_boc(bytes: &[u8]) -> Result<tycho::ShardStateUnsplit> {
+pub fn migrate_boc(
+    bytes: &[u8],
+    shard_state_hashes: Option<&ShardStateHashes>,
+    current_validator_set: Option<&tycho::ValidatorSet>,
+    time_ms: Option<u64>,
+) -> Result<tycho::ShardStateUnsplit> {
     let old_state = ton_block::ShardStateUnsplit::construct_from_bytes(bytes)?;
     println!("Migrating Everscale shard state {}", old_state.id());
-    migrate_state(&old_state)
+    migrate_state(
+        &old_state,
+        shard_state_hashes,
+        current_validator_set,
+        time_ms,
+    )
 }
 
-pub fn migrate_file(path: impl AsRef<Path>) -> Result<tycho::ShardStateUnsplit> {
+pub fn migrate_file(
+    path: impl AsRef<Path>,
+    shard_state_hashes: Option<&ShardStateHashes>,
+    current_validator_set: Option<&tycho::ValidatorSet>,
+    time_ms: Option<u64>,
+) -> Result<tycho::ShardStateUnsplit> {
     let file = File::open(path.as_ref())?;
     // SAFETY: The file is opened read-only and the mapping does not outlive it.
     let bytes = unsafe { Mmap::map(&file)? };
-    migrate_boc(&bytes)
+    migrate_boc(&bytes, shard_state_hashes, current_validator_set, time_ms)
 }
 
 fn convert_via_boc<T, O>(value: &O) -> Result<T>
@@ -178,13 +231,19 @@ fn map_shard_description(
     })
 }
 
-fn map_shard_hashes(old_shard_hashes: &ton_block::ShardHashes) -> Result<tycho::ShardHashes> {
+fn map_shard_hashes(
+    old_shard_hashes: &ton_block::ShardHashes,
+    shard_state_hashes: Option<&ShardStateHashes>,
+) -> Result<tycho::ShardHashes> {
     let mut shard_entries = Vec::new();
     old_shard_hashes.iterate_shards(|old_shard_ident, old_shard_description| {
-        shard_entries.push((
-            map_shard_ident(&old_shard_ident)?,
-            map_shard_description(&old_shard_description)?,
-        ));
+        let shard_ident = map_shard_ident(&old_shard_ident)?;
+        let mut shard_description = map_shard_description(&old_shard_description)?;
+        if let Some(hashes) = shard_state_hashes.and_then(|hashes| hashes.get(&shard_ident)) {
+            shard_description.root_hash = hashes.root_hash;
+            shard_description.file_hash = hashes.file_hash;
+        }
+        shard_entries.push((shard_ident, shard_description));
         Ok(true)
     })?;
 
@@ -196,6 +255,8 @@ fn map_shard_hashes(old_shard_hashes: &ton_block::ShardHashes) -> Result<tycho::
 fn map_blockchain_config(
     old_config: &ton_block::ConfigParams,
     global_id: i32,
+    shard_state_hashes: Option<&ShardStateHashes>,
+    current_validator_set: Option<&tycho::ValidatorSet>,
 ) -> Result<tycho::BlockchainConfig> {
     let address = convert_hash(&old_config.config_addr);
     let mut config = match old_config.config_params.data() {
@@ -206,7 +267,142 @@ fn map_blockchain_config(
         None => tycho::BlockchainConfig::new_empty(address),
     };
     map_blockchain_config_params(&mut config.params, old_config, global_id)?;
+    if let Some(current_validator_set) = current_validator_set {
+        config.params.remove(35)?;
+        config.params.set::<ConfigParam34>(current_validator_set)?;
+    }
+    override_workchain_zerostates(&mut config.params, shard_state_hashes)?;
     Ok(config)
+}
+
+fn prepare_hardfork_state(
+    state: &mut tycho::ShardStateUnsplit,
+    shard_state_hashes: Option<&ShardStateHashes>,
+    time_ms: Option<u64>,
+) -> Result<()> {
+    let state_time_ms = state.gen_utime as u64 * 1000 + state.gen_utime_ms as u64;
+    if let Some(time_ms) = time_ms {
+        if state_time_ms > time_ms {
+            return Err(MigrationError::HardforkInPast {
+                state_time_ms,
+                hardfork_time_ms: time_ms,
+            });
+        }
+        state.gen_utime = (time_ms / 1000) as u32;
+        state.gen_utime_ms = (time_ms % 1000) as u16;
+    }
+
+    state.min_ref_mc_seqno = u32::MAX;
+    state.processed_upto = tycho::ShardStateUnsplit::empty_processed_upto_info().clone();
+    state.master_ref = None;
+    state.overload_history = 0;
+
+    let Some(custom) = state.custom.take() else {
+        return Ok(());
+    };
+    let mut custom = custom.load()?;
+    prepare_hardfork_mc_state_extra(
+        &mut custom,
+        state.seqno,
+        state.gen_utime,
+        state.gen_utime as u64 * 1000 + state.gen_utime_ms as u64,
+        &state.total_balance,
+        shard_state_hashes,
+    )?;
+    state.custom = Some(Lazy::new(&custom)?);
+
+    Ok(())
+}
+
+fn prepare_hardfork_mc_state_extra(
+    custom: &mut tycho::McStateExtra,
+    mc_seqno: u32,
+    gen_utime: u32,
+    genesis_millis: u64,
+    total_balance: &tycho::CurrencyCollection,
+    shard_state_hashes: Option<&ShardStateHashes>,
+) -> Result<()> {
+    let mut shards = Vec::new();
+    for entry in custom.shards.iter() {
+        let (ident, mut shard_description) = entry?;
+        if let Some(hashes) = shard_state_hashes.and_then(|hashes| hashes.get(&ident)) {
+            shard_description.root_hash = hashes.root_hash;
+            shard_description.file_hash = hashes.file_hash;
+        }
+        shard_description.reg_mc_seqno = mc_seqno;
+        shard_description.nx_cc_updated = true;
+        shard_description.next_catchain_seqno = 0;
+        shard_description.ext_processed_to_anchor_id = 0;
+        shard_description.top_sc_block_updated = false;
+        shard_description.min_ref_mc_seqno = u32::MAX;
+        shard_description.gen_utime = gen_utime;
+        shards.push((ident, shard_description));
+    }
+
+    let current_validator_set = custom.config.params.get_current_validator_set()?;
+    let collation_config = custom.config.params.get_collation_config()?;
+    let session_seqno = 0;
+    let Some((_, validator_list_hash_short)) = current_validator_set
+        .compute_mc_subset(session_seqno, collation_config.shuffle_mc_validators)
+    else {
+        return Err(MigrationError::ValidatorSubset);
+    };
+
+    custom.shards =
+        tycho::ShardHashes::from_shards(shards.iter().map(|(ident, descr)| (ident, descr)))?;
+    custom.validator_info = tycho::ValidatorInfo {
+        validator_list_hash_short,
+        catchain_seqno: session_seqno,
+        nx_cc_updated: true,
+    };
+    custom.consensus_info = tycho::ConsensusInfo {
+        vset_switch_round: session_seqno,
+        prev_vset_switch_round: session_seqno,
+        genesis_info: tycho::GenesisInfo {
+            start_round: 0,
+            genesis_millis,
+        },
+        prev_shuffle_mc_validators: collation_config.shuffle_mc_validators,
+    };
+    custom.prev_blocks = AugDict::new();
+    custom.after_key_block = true;
+    custom.last_key_block = None;
+    custom.block_create_stats = None;
+    custom.global_balance = total_balance.clone();
+
+    Ok(())
+}
+
+fn override_workchain_zerostates(
+    params: &mut BlockchainConfigParams,
+    shard_state_hashes: Option<&ShardStateHashes>,
+) -> Result<()> {
+    let Some(shard_state_hashes) = shard_state_hashes else {
+        return Ok(());
+    };
+    let Some(mut workchains) = params.get::<tycho::ConfigParam12>()? else {
+        return Ok(());
+    };
+
+    let mut updated = false;
+    for entry in workchains.clone().iter() {
+        let (workchain, mut description) = entry?;
+        let shard_ident = tycho::ShardIdent::new_full(workchain);
+        let Some(hashes) = shard_state_hashes.get(&shard_ident) else {
+            continue;
+        };
+
+        description.zerostate_root_hash = hashes.root_hash;
+        description.zerostate_file_hash = hashes.file_hash;
+        workchains.set(workchain, &description)?;
+        updated = true;
+    }
+
+    if updated {
+        params.set_workchains(&workchains)?;
+    }
+
+    Ok(())
 }
 
 fn map_legacy_burning_config(owner_addr: &ton_types::UInt256) -> tycho::BurningConfig {
@@ -313,6 +509,37 @@ fn default_tycho_size_limits_config() -> tycho::SizeLimitsConfig {
     }
 }
 
+fn default_tycho_global_version() -> tycho::GlobalVersion {
+    tycho::GlobalVersion {
+        version: 100,
+        capabilities: tycho::GlobalCapabilities::from([
+            tycho::GlobalCapability::CapCreateStatsEnabled,
+            tycho::GlobalCapability::CapBounceMsgBody,
+            tycho::GlobalCapability::CapReportVersion,
+            tycho::GlobalCapability::CapShortDequeue,
+            tycho::GlobalCapability::CapInitCodeHash,
+            tycho::GlobalCapability::CapOffHypercube,
+            tycho::GlobalCapability::CapFixTupleIndexBug,
+            tycho::GlobalCapability::CapFastStorageStat,
+            tycho::GlobalCapability::CapMyCode,
+            tycho::GlobalCapability::CapFullBodyInBounced,
+            tycho::GlobalCapability::CapStorageFeeToTvm,
+            tycho::GlobalCapability::CapWorkchains,
+            tycho::GlobalCapability::CapStcontNewFormat,
+            tycho::GlobalCapability::CapFastStorageStatBugfix,
+            tycho::GlobalCapability::CapResolveMerkleCell,
+            tycho::GlobalCapability::CapFeeInGasUnits,
+            tycho::GlobalCapability::CapSignatureWithId,
+            tycho::GlobalCapability::CapBounceAfterFailedAction,
+            tycho::GlobalCapability::CapSuspendedList,
+            tycho::GlobalCapability::CapsTvmBugfixes2022,
+            tycho::GlobalCapability::CapSuspendByMarks,
+            tycho::GlobalCapability::CapOmitMasterBlockHistory,
+            tycho::GlobalCapability::CapSignatureDomain,
+        ]),
+    }
+}
+
 fn map_blockchain_config_params(
     params: &mut BlockchainConfigParams,
     old_params: &ton_block::ConfigParams,
@@ -326,6 +553,7 @@ fn map_blockchain_config_params(
 
     params.set_consensus_config(&default_tycho_consensus_config())?;
     params.set_global_id(global_id)?;
+    params.set_global_version(&default_tycho_global_version())?;
     params.set_size_limits(&default_tycho_size_limits_config())?;
 
     params.remove(50)?;
@@ -374,23 +602,6 @@ fn update_config_account(
     Ok(())
 }
 
-fn map_prev_blocks(
-    old_prev_blocks: &ton_block::OldMcBlocksInfo,
-) -> Result<tycho_types::dict::AugDict<u32, tycho::KeyMaxLt, tycho::KeyBlockRef>> {
-    let Some(root) = old_prev_blocks.data().cloned() else {
-        return Ok(tycho_types::dict::AugDict::new());
-    };
-
-    let root = convert_old_cell(&root)?;
-    let mut slice = root.as_slice()?;
-    let dict = tycho_types::dict::AugDict::load_from_root_ext(
-        &mut slice,
-        tycho_types::cell::Cell::empty_context(),
-    )?;
-    println!("Converted prev blocks");
-    Ok(dict)
-}
-
 fn map_libraries(
     old_libraries: &ton_block::Libraries,
 ) -> Result<tycho_types::dict::Dict<tycho_types::cell::HashBytes, tycho::LibDescr>> {
@@ -411,9 +622,10 @@ fn map_libraries(
 fn map_mc_state_extra(
     old_mc_state_extra: &ton_block::McStateExtra,
     config: tycho::BlockchainConfig,
+    shard_state_hashes: Option<&ShardStateHashes>,
 ) -> Result<tycho::McStateExtra> {
     println!("MC extra: mapping shards...");
-    let shards = map_shard_hashes(&old_mc_state_extra.shards)?;
+    let shards = map_shard_hashes(&old_mc_state_extra.shards, shard_state_hashes)?;
     println!("MC extra: mapped shards");
 
     println!("MC extra: mapping validator info...");
@@ -424,12 +636,9 @@ fn map_mc_state_extra(
     };
     println!("MC extra: mapped validator info");
 
-    println!("MC extra: mapping prev blocks...");
-    let prev_blocks = map_prev_blocks(&old_mc_state_extra.prev_blocks)?;
-    println!("MC extra: mapped prev blocks");
-
     println!("MC extra: mapping block create stats...");
-    let block_create_stats = map_block_create_stats(old_mc_state_extra.block_create_stats.as_ref())?;
+    let block_create_stats =
+        map_block_create_stats(old_mc_state_extra.block_create_stats.as_ref())?;
     println!("MC extra: mapped block create stats");
 
     println!("MC extra: mapping global balance...");
@@ -441,7 +650,7 @@ fn map_mc_state_extra(
         config,
         validator_info,
         consensus_info: tycho::ConsensusInfo::ZEROSTATE,
-        prev_blocks,
+        prev_blocks: AugDict::new(), // we can drop prev block since its not needed
         after_key_block: old_mc_state_extra.after_key_block,
         last_key_block: old_mc_state_extra
             .last_key_block

@@ -1,16 +1,15 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use tycho_types::boc::ser::BocHeader;
 use tycho_types::cell::{CellBuilder, HashBytes};
-use tycho_types::cell::Lazy;
 use tycho_types::models as tycho;
-use tycho_types::models::ConfigParam34;
-use serde::Serialize;
 
 use crate::MigrateArgs;
-use crate::migration::migrate_file;
+use crate::migration::{ShardStateHashes, ShardStateHashesEntry, migrate_file};
 
 #[derive(Debug, Serialize)]
 struct ZerostateIdJson {
@@ -56,57 +55,58 @@ fn load_current_validator_set(path: &std::path::Path) -> Result<tycho::Validator
         .with_context(|| format!("failed to parse validator set json {}", path.display()))
 }
 
-fn override_current_validator_set(
-    state: &mut tycho::ShardStateUnsplit,
-    validator_set: tycho::ValidatorSet,
-) -> Result<()> {
-    let Some(custom) = state.custom.take() else {
-        anyhow::bail!("`--current-validator-set` requires a masterchain state");
-    };
-    let mut custom = custom
-        .load()
-        .context("failed to load migrated mc state extra")?;
+fn load_shard_state_hashes(paths: &[PathBuf]) -> Result<ShardStateHashes> {
+    let mut result = ShardStateHashes::default();
+    for path in paths {
+        let data = std::fs::read(path)
+            .with_context(|| format!("failed to read shard-state boc {}", path.display()))?;
+        let root = tycho_types::boc::Boc::decode(data.as_slice())
+            .with_context(|| format!("failed to decode shard-state boc {}", path.display()))?;
+        let state: tycho::ShardStateUnsplit = tycho_types::boc::BocRepr::decode(data.as_slice())
+            .with_context(|| format!("failed to parse shard-state boc {}", path.display()))?;
+        let shard_ident = state.shard_ident;
 
-    custom.config.params.remove(35)?;
-    custom.config.params.set::<ConfigParam34>(&validator_set)?;
+        let prev = result.insert(
+            shard_ident,
+            ShardStateHashesEntry {
+                root_hash: *root.repr_hash(),
+                file_hash: (*blake3::hash(&data).as_bytes()).into(),
+            },
+        );
+        anyhow::ensure!(
+            prev.is_none(),
+            "duplicate shard {} in shard-state files",
+            shard_ident,
+        );
+    }
 
-    let collation_config = custom
-        .config
-        .params
-        .get_collation_config()
-        .context("failed to load collation config after validator-set override")?;
-    let session_seqno = custom.validator_info.catchain_seqno;
-    let Some((_, validator_list_hash_short)) =
-        validator_set.compute_mc_subset(session_seqno, collation_config.shuffle_mc_validators)
-    else {
-        anyhow::bail!("failed to compute validator subset for overridden current validator set");
-    };
-    custom.validator_info.validator_list_hash_short = validator_list_hash_short;
-
-    state.custom = Some(Lazy::new(&custom).context("failed to rebuild mc state extra")?);
-    println!("validator set overridden successfully");
-    Ok(())
+    Ok(result)
 }
 
 impl MigrateArgs {
     pub fn run(self) -> Result<()> {
-        let mut migrated = migrate_file(&self.input)
-            .with_context(|| format!("failed to migrate {}", self.input.display()))?;
+        let shard_state_hashes = (!self.shard_state.is_empty())
+            .then(|| load_shard_state_hashes(&self.shard_state))
+            .transpose()?;
+        let current_validator_set = self
+            .current_validator_set
+            .as_deref()
+            .map(load_current_validator_set)
+            .transpose()?;
 
-        if let Some(path) = self.current_validator_set.as_deref() {
-            let validator_set = load_current_validator_set(path)?;
-            override_current_validator_set(&mut migrated, validator_set).with_context(|| {
-                format!(
-                    "failed to apply validator-set override from {}",
-                    path.display()
-                )
-            })?;
-        }
+        let migrated = migrate_file(
+            &self.input,
+            shard_state_hashes.as_ref(),
+            current_validator_set.as_ref(),
+            self.time,
+        )
+        .with_context(|| format!("failed to migrate {}", self.input.display()))?;
 
+        let seqno = migrated.seqno;
         let migrated =
             CellBuilder::build_from(migrated).context("failed to build migrated shard state")?;
         let zerostate_id = ZerostateIdJson {
-            seqno: 0,
+            seqno,
             root_hash: *migrated.repr_hash(),
             file_hash: HashBytes::ZERO,
         };
@@ -131,12 +131,6 @@ impl MigrateArgs {
         let zerostate_id_json = serde_json::to_string_pretty(&zerostate_id)
             .context("failed to serialize zerostate id json")?;
         println!("{zerostate_id_json}");
-
-        if let Some(path) = self.zerostate_id_output.as_deref() {
-            std::fs::write(path, format!("{zerostate_id_json}\n"))
-                .with_context(|| format!("failed to write zerostate id {}", path.display()))?;
-            println!("zerostate id written to {}", path.display());
-        }
         Ok(())
     }
 }
