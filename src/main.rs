@@ -49,10 +49,12 @@ struct MigrateArgs {
     input: PathBuf,
     #[arg(long = "output", short = 'o')]
     output: PathBuf,
+    #[arg(long = "time")]
+    time: Option<u64>,
     #[arg(long = "current-validator-set")]
     current_validator_set: Option<PathBuf>,
-    #[arg(long = "zerostate-id-output")]
-    zerostate_id_output: Option<PathBuf>,
+    #[arg(long = "shard-state")]
+    shard_state: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
