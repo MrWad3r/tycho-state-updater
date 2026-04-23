@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use serde::Deserializer;
 mod global_config_json;
 mod migrate;
 mod migration;

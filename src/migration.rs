@@ -1,35 +1,22 @@
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 
+use crate::global_config_json::GlobalConfig;
 use crate::old_models::{OldMcStateExtra, OldShardDescription, OldShardStateUnsplit};
 use anyhow::{Context, Result};
 use memmap2::Mmap;
 use serde::Serialize;
-use thiserror::Error;
 use tycho_types::boc::Boc;
 use tycho_types::cell::{CellBuilder, HashBytes, Lazy, Load};
 use tycho_types::dict::AugDict;
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
 use tycho_types::models::{
-    BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection, ShardIdent,
-    ShardStateUnsplit,
+    BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection, DepthBalanceInfo,
+    ShardAccount, ShardAccounts, ShardIdent, ShardStateUnsplit,
 };
-
-#[derive(Debug, Error)]
-pub enum MigrationError {
-    #[error("Type error {0}")]
-    Tycho(#[from] TychoError),
-    #[error(
-        "cannot make hardfork in the past: state_time_ms={state_time_ms}, hardfork_time_ms={hardfork_time_ms}"
-    )]
-    HardforkInPast {
-        state_time_ms: u64,
-        hardfork_time_ms: u64,
-    },
-    #[error("failed to compute validator subset for hardfork state")]
-    ValidatorSubset,
-}
+use tycho_types::num::Tokens;
 
 #[derive(Debug, Copy, Clone, Serialize)]
 pub struct ZerostateId {
@@ -37,16 +24,15 @@ pub struct ZerostateId {
     pub root_hash: HashBytes,
     pub file_hash: HashBytes,
 }
-
 pub fn migrate_state(
     old_state: &OldShardStateUnsplit,
-    config: Option<BlockchainConfig>,
+    config: Option<GlobalConfig>,
     shard_state_id: Option<ZerostateId>,
     shard_balance: Option<CurrencyCollection>,
     current_validator_set: Option<tycho::ValidatorSet>,
     time_ms: u64,
 ) -> Result<(ShardStateUnsplit, CurrencyCollection)> {
-    let total_balance;
+    let mut total_balance;
     let (accounts, custom) = {
         let mut shard_accounts = old_state
             .load_accounts()
@@ -56,17 +42,29 @@ pub fn migrate_state(
 
         match old_state.load_custom()? {
             Some(custom) => {
-                let Some(mut config) = config else {
+                let Some(mut global_config) = config else {
                     anyhow::bail!("failed to load custom config");
                 };
 
-                println!("Updating masterchain config...");
-                override_validator_set(&mut config.params, current_validator_set.as_ref())?;
+                // since validators are in masterchain update only if extra is present
+                let stake = global_config.config.get_validator_stake_params()?;
+                let validator_balance = add_validator_accounts(
+                    &mut shard_accounts,
+                    stake.min_stake,
+                    global_config.validator_accounts,
+                )?;
+                total_balance = total_balance.checked_add(&validator_balance)?;
 
-                override_workchain_zerostates(&mut config.params, shard_state_id)?;
+                println!("Updating masterchain config...");
+                override_validator_set(
+                    &mut global_config.config.params,
+                    current_validator_set.as_ref(),
+                )?;
+
+                override_workchain_zerostates(&mut global_config.config.params, shard_state_id)?;
                 println!("Mapped masterchain config");
 
-                update_config_account(&mut shard_accounts, &config)?;
+                update_config_account(&mut shard_accounts, &global_config.config)?;
 
                 println!("Serializing accounts before prev_blocks...");
                 let accounts = Lazy::new(&shard_accounts)?;
@@ -85,8 +83,13 @@ pub fn migrate_state(
                 };
 
                 println!("Mapping masterchain extra...");
-                let custom = map_mc_state_extra(&custom, config, shard_state_id, global_balance)
-                    .context("failed to map masterchain extra")?;
+                let custom = map_mc_state_extra(
+                    &custom,
+                    global_config.config,
+                    shard_state_id,
+                    global_balance,
+                )
+                .context("failed to map masterchain extra")?;
                 println!("Mapped masterchain extra");
 
                 (accounts, Some(Lazy::new(&custom)?))
@@ -131,15 +134,20 @@ pub fn migrate_state(
 
 pub fn migrate_boc(
     bytes: &[u8],
-    config: Option<BlockchainConfig>,
+    config: Option<GlobalConfig>,
     shard_state_id: Option<ZerostateId>,
     shard_balance: Option<CurrencyCollection>,
     current_validator_set: Option<tycho::ValidatorSet>,
     time_ms: u64,
 ) -> Result<(ShardStateUnsplit, CurrencyCollection)> {
     let boc = Boc::decode(bytes)?;
-    let old_state = OldShardStateUnsplit::load_from(&mut boc.as_slice()?)?;
-    println!("Migrating Everscale shard state {}", old_state.seqno);
+    println!("State cell decoded sucessfully...");
+    let old_state = OldShardStateUnsplit::load_from(&mut boc.as_slice()?)
+        .context("failed to load old state")?;
+    println!(
+        "Migrating Everscale state {}:{}",
+        old_state.shard_ident, old_state.seqno,
+    );
     migrate_state(
         &old_state,
         config,
@@ -162,7 +170,7 @@ pub fn migrate_shardstate_file(
 
 pub fn migrate_masterstate_file(
     path: impl AsRef<Path>,
-    config: BlockchainConfig,
+    config: GlobalConfig,
     shard_state_id: ZerostateId,
     shard_balance: CurrencyCollection,
     current_validator_set: tycho::ValidatorSet,
@@ -171,6 +179,7 @@ pub fn migrate_masterstate_file(
     let file = File::open(path.as_ref())?;
     // SAFETY: The file is opened read-only and the mapping does not outlive it.
     let bytes = unsafe { Mmap::map(&file)? };
+    println!("Migrating masterstate file {}", path.as_ref().display());
     migrate_boc(
         &bytes,
         Some(config),
@@ -267,6 +276,34 @@ fn override_validator_set(
     }
 
     Ok(())
+}
+
+fn add_validator_accounts(
+    accounts: &mut ShardAccounts,
+    balance_tokens: Tokens,
+    validator_addresses: BTreeMap<HashBytes, String>,
+) -> Result<CurrencyCollection> {
+    let mut balance = Tokens::ZERO;
+    for (address, data) in validator_addresses {
+        let data = Boc::decode_base64(&data)?;
+        let shard_account = ShardAccount::load_from(&mut data.as_slice()?)?;
+        accounts.add(
+            address,
+            DepthBalanceInfo {
+                split_depth: 0,
+                balance: CurrencyCollection {
+                    tokens: balance_tokens,
+                    other: Default::default(),
+                },
+            },
+            shard_account.clone(),
+        )?;
+        balance += balance_tokens;
+    }
+    Ok(CurrencyCollection {
+        tokens: balance,
+        other: Default::default(),
+    })
 }
 
 fn prepare_hardfork_state(

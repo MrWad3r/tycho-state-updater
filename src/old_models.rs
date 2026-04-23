@@ -2,8 +2,8 @@ use tycho_types::cell::{Cell, CellSlice, HashBytes, Lazy, Load};
 use tycho_types::dict::{AugDict, Dict};
 use tycho_types::error::Error;
 use tycho_types::models::{
-    BlockId, BlockRef, BlockchainConfig, CreatorStats, CurrencyCollection, FutureSplitMerge,
-    KeyBlockRef, KeyMaxLt, LibDescr, ShardAccounts, ShardHashes, ShardIdent, ValidatorInfo,
+    BlockRef, BlockchainConfig, CreatorStats, CurrencyCollection, FutureSplitMerge, KeyBlockRef,
+    KeyMaxLt, LibDescr, ShardAccounts, ShardHashes, ShardIdent, ValidatorInfo,
 };
 
 macro_rules! ok {
@@ -244,16 +244,6 @@ impl OldShardDescription {
 
     const TAG_V1: u8 = 0xa;
     const TAG_V2: u8 = 0xb;
-
-    /// Converts a `ShardDescription` to a `BlockId` given a shard identifier.
-    pub fn as_block_id(&self, shard: ShardIdent) -> BlockId {
-        BlockId {
-            shard,
-            seqno: self.seqno,
-            root_hash: self.root_hash,
-            file_hash: self.file_hash,
-        }
-    }
 }
 
 impl<'a> Load<'a> for OldShardDescription {
@@ -278,10 +268,7 @@ impl<'a> Load<'a> for OldShardDescription {
         }
 
         let next_catchain_seqno = ok!(slice.load_u32());
-        #[cfg(not(feature = "tycho"))]
         let next_validator_shard = ok!(slice.load_u64());
-        #[cfg(feature = "tycho")]
-        let ext_processed_to_anchor_id = ok!(slice.load_u32());
         let min_ref_mc_seqno = ok!(slice.load_u32());
         let gen_utime = ok!(slice.load_u32());
         let split_merge_at = ok!(Option::<FutureSplitMerge>::load_from(slice));

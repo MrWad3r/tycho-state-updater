@@ -9,7 +9,7 @@ use tycho_types::models as tycho;
 use tycho_types::models::ShardStateUnsplit;
 
 use crate::MigrateArgs;
-use crate::global_config_json::make_blockchain_config;
+use crate::global_config_json::make_global_config;
 use crate::migration::{ZerostateId, migrate_masterstate_file, migrate_shardstate_file};
 
 struct HashingWriter<W> {
@@ -55,11 +55,17 @@ impl MigrateArgs {
             migrate_shardstate_file(&self.shard_state, self.time)
                 .with_context(|| format!("failed to migrate {}", self.shard_state.display()))?;
 
-        let shard_state_id =
-            self.write_state_to_file(migrates_shard_state, Path::new("0:8000000000000000.d.boc"))?;
+        let shard_state_id = self.write_state_to_file(
+            migrates_shard_state,
+            Path::new("../../tycho/.temp/states/0:8000000000000000.d.boc"),
+        )?;
 
-        let config = make_blockchain_config(self.config.clone())?;
+        println!("Making blockchain config...");
+        let config = make_global_config(self.config.clone())?;
+        println!("Blockchain config successfully made.");
+        println!("Loading new validator set...");
         let current_validator_set = load_current_validator_set(&self.current_validator_set)?;
+        println!("Current validator set successfully loaded.");
 
         let (migrates_shard_state, _) = migrate_masterstate_file(
             &self.master_state,
@@ -71,8 +77,10 @@ impl MigrateArgs {
         )
         .with_context(|| format!("failed to migrate {}", self.shard_state.display()))?;
 
-        let _ =
-            self.write_state_to_file(migrates_shard_state, Path::new("-1:8000000000000000.d.boc"))?;
+        let _ = self.write_state_to_file(
+            migrates_shard_state,
+            Path::new("../../tycho/.temp/states/-1:8000000000000000.d.boc"),
+        )?;
 
         Ok(())
     }
@@ -92,7 +100,7 @@ impl MigrateArgs {
         };
 
         let output = BufWriter::new(
-            File::create(&self.output.as_path().join(path.as_ref()))
+            File::create(path.as_ref())
                 .with_context(|| format!("failed to create {}", self.output.display()))?,
         );
         let mut output = HashingWriter::new(output);
