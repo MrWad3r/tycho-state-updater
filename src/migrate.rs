@@ -110,7 +110,10 @@ impl MigrateArgs {
         output.flush()?;
         let (mut output, file_hash) = output.finalize();
         output.flush()?;
-        println!("migrated shard state written to {}", path.as_ref().display());
+        println!(
+            "migrated shard state written to {}",
+            path.as_ref().display()
+        );
 
         let zerostate_id = ZerostateId {
             file_hash,

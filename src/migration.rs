@@ -9,15 +9,12 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::OnceLock;
 use tycho_types::abi::{AbiType, AbiValue, AbiVersion, FromAbi, IntoAbi, WithAbiType};
-use tycho_types::boc::Boc;
+use tycho_types::boc::{Boc, BocRepr};
 use tycho_types::cell::{CellBuilder, HashBytes, Lazy, Load};
 use tycho_types::dict::AugDict;
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
-use tycho_types::models::{
-    AccountState, BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection,
-    DepthBalanceInfo, ShardAccount, ShardAccounts, ShardIdent, ShardStateUnsplit,
-};
+use tycho_types::models::{AccountState, BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection, DepthBalanceInfo, OptionalAccount, ShardAccount, ShardAccounts, ShardStateUnsplit};
 use tycho_types::num::Tokens;
 
 #[derive(Debug, Copy, Clone, Serialize)]
@@ -49,10 +46,8 @@ pub fn migrate_state(
                 };
 
                 // since validators are in masterchain update only if extra is present
-                let stake = global_config.config.get_validator_stake_params()?;
                 let validator_balance = add_validator_accounts(
                     &mut shard_accounts,
-                    stake.min_stake,
                     global_config.validator_accounts,
                 )?;
                 total_balance = total_balance.checked_add(&validator_balance)?;
@@ -77,16 +72,16 @@ pub fn migrate_state(
                     anyhow::bail!("failed to reset elector account");
                 }
 
-                // let elector_address = global_config.config.get_elector_address()?;
-                // if let Some((depth_balance, mut elector_account)) =
-                //     shard_accounts.get(elector_address)?
-                // {
-                //     reset_elector_account(&mut elector_account)?;
-                //     shard_accounts.set(elector_address, depth_balance, elector_account)?;
-                //     println!("Elector contract was reset!");
-                // } else {
-                //     anyhow::bail!("failed to reset elector account");
-                // }
+                let elector_address = global_config.config.get_elector_address()?;
+                if let Some((depth_balance, mut elector_account)) =
+                    shard_accounts.get(elector_address)?
+                {
+                    reset_elector_account(&mut elector_account)?;
+                    shard_accounts.set(elector_address, depth_balance, elector_account)?;
+                    println!("Elector contract was reset!");
+                } else {
+                    anyhow::bail!("failed to reset elector account");
+                }
 
                 println!("Serializing accounts before prev_blocks...");
                 let accounts = Lazy::new(&shard_accounts)?;
@@ -267,9 +262,6 @@ fn map_shard_hashes(
 
         let sd = OldShardDescription::load_from(&mut shard_description)?;
 
-        if shard_ident != ShardIdent::BASECHAIN {
-            continue;
-        }
         let mut new_shard_description = map_shard_description(&sd);
 
         if let Some(id) = shard_state_hashes {
@@ -302,25 +294,31 @@ fn override_validator_set(
 
 fn add_validator_accounts(
     accounts: &mut ShardAccounts,
-    balance_tokens: Tokens,
     validator_addresses: BTreeMap<HashBytes, String>,
 ) -> Result<CurrencyCollection> {
     let mut balance = Tokens::ZERO;
     for (address, data) in validator_addresses {
-        let data = Boc::decode_base64(&data)?;
-        let shard_account = ShardAccount::load_from(&mut data.as_slice()?)?;
+        let data: OptionalAccount = BocRepr::decode_base64(&data)?;
+        let Some(account) = data.0 else {
+            anyhow::bail!("invalid account");
+        };
+
+        let tokens = account.balance.tokens;
+        let sa = ShardAccount {
+            account: Lazy::new(&OptionalAccount(Some(account.clone())))?,
+            last_trans_hash: Default::default(),
+            last_trans_lt: 0,
+        };
+
         accounts.add(
             address,
             DepthBalanceInfo {
                 split_depth: 0,
-                balance: CurrencyCollection {
-                    tokens: balance_tokens,
-                    other: Default::default(),
-                },
+                balance: account.balance,
             },
-            shard_account.clone(),
+            sa,
         )?;
-        balance += balance_tokens;
+        balance += tokens;
     }
     Ok(CurrencyCollection {
         tokens: balance,
@@ -473,10 +471,6 @@ fn prepare_hardfork_mc_state_extra(
     for entry in custom.shards.iter() {
         let (ident, mut shard_description) = entry?;
 
-        if ident != ShardIdent::BASECHAIN {
-            continue;
-        }
-
         if let Some(id) = shard_state_hashes {
             shard_description.root_hash = id.root_hash;
             shard_description.file_hash = id.file_hash;
@@ -542,7 +536,7 @@ fn override_workchain_zerostates(
         let (workchain, mut description) = entry?;
 
         let shard_ident = tycho::ShardIdent::new_full(workchain);
-        if shard_ident != ShardIdent::BASECHAIN {
+        if shard_ident.is_masterchain() {
             continue;
         }
 
