@@ -8,9 +8,9 @@ use tycho_types::cell::{CellBuilder, HashBytes};
 use tycho_types::models as tycho;
 use tycho_types::models::ShardStateUnsplit;
 
+use crate::global_config::make_global_config;
+use crate::migration::{migrate_masterstate_file, migrate_shardstate_file, ZerostateId};
 use crate::MigrateArgs;
-use crate::global_config_json::make_global_config;
-use crate::migration::{ZerostateId, migrate_masterstate_file, migrate_shardstate_file};
 
 struct HashingWriter<W> {
     inner: W,
@@ -57,7 +57,7 @@ impl MigrateArgs {
 
         let shard_state_id = self.write_state_to_file(
             migrates_shard_state,
-            Path::new("../../tycho/.temp/states/0:8000000000000000.d.boc"),
+            Path::new("0:8000000000000000.d.boc"),
         )?;
 
         println!("Making blockchain config...");
@@ -75,11 +75,11 @@ impl MigrateArgs {
             current_validator_set,
             self.time,
         )
-        .with_context(|| format!("failed to migrate {}", self.shard_state.display()))?;
+            .with_context(|| format!("failed to migrate {}", self.shard_state.display()))?;
 
         let _ = self.write_state_to_file(
             migrates_shard_state,
-            Path::new("../../tycho/.temp/states/-1:8000000000000000.d.boc"),
+            Path::new("-1:8000000000000000.d.boc"),
         )?;
 
         Ok(())
@@ -101,16 +101,16 @@ impl MigrateArgs {
 
         let output = BufWriter::new(
             File::create(path.as_ref())
-                .with_context(|| format!("failed to create {}", self.output.display()))?,
+                .with_context(|| format!("failed to create {}", path.as_ref().display()))?,
         );
         let mut output = HashingWriter::new(output);
         BocHeader::<std::collections::hash_map::RandomState>::with_root(migrated.as_ref())
             .encode_to_writer(&mut output)
-            .with_context(|| format!("failed to write {}", self.output.display()))?;
+            .with_context(|| format!("failed to write {}", path.as_ref().display()))?;
         output.flush()?;
         let (mut output, file_hash) = output.finalize();
         output.flush()?;
-        println!("migrated shard state written to {}", self.output.display());
+        println!("migrated shard state written to {}", path.as_ref().display());
 
         let zerostate_id = ZerostateId {
             file_hash,

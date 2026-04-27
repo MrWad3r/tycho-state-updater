@@ -71,22 +71,6 @@ impl OldShardStateUnsplit {
             None => Ok(None),
         }
     }
-
-    // /// Tries to set additional masterchain data.
-    // pub fn set_custom(&mut self, value: Option<&McStateExtra>) -> Result<(), Error> {
-    //     match (&mut self.custom, value) {
-    //         (None, None) => Ok(()),
-    //         (None, Some(value)) => {
-    //             self.custom = Some(ok!(Lazy::new(value)));
-    //             Ok(())
-    //         }
-    //         (Some(_), None) => {
-    //             self.custom = None;
-    //             Ok(())
-    //         }
-    //         (Some(custom), Some(value)) => custom.set(value),
-    //     }
-    // }
 }
 
 impl<'a> Load<'a> for OldShardStateUnsplit {

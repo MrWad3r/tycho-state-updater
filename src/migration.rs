@@ -1,20 +1,22 @@
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::path::Path;
-
-use crate::global_config_json::GlobalConfig;
-use crate::old_models::{OldMcStateExtra, OldShardDescription, OldShardStateUnsplit};
+use crate::global_config::GlobalConfig;
+use crate::models::elector::PartialElectorData;
+use crate::models::old_models::{OldMcStateExtra, OldShardDescription, OldShardStateUnsplit};
 use anyhow::{Context, Result};
 use memmap2::Mmap;
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::path::Path;
+use std::sync::OnceLock;
+use tycho_types::abi::{AbiType, AbiValue, AbiVersion, FromAbi, IntoAbi, WithAbiType};
 use tycho_types::boc::Boc;
 use tycho_types::cell::{CellBuilder, HashBytes, Lazy, Load};
 use tycho_types::dict::AugDict;
 use tycho_types::error::Error as TychoError;
 use tycho_types::models as tycho;
 use tycho_types::models::{
-    BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection, DepthBalanceInfo,
-    ShardAccount, ShardAccounts, ShardIdent, ShardStateUnsplit,
+    AccountState, BlockchainConfig, BlockchainConfigParams, ConfigParam34, CurrencyCollection,
+    DepthBalanceInfo, ShardAccount, ShardAccounts, ShardIdent, ShardStateUnsplit,
 };
 use tycho_types::num::Tokens;
 
@@ -64,7 +66,27 @@ pub fn migrate_state(
                 override_workchain_zerostates(&mut global_config.config.params, shard_state_id)?;
                 println!("Mapped masterchain config");
 
-                update_config_account(&mut shard_accounts, &global_config.config)?;
+                let config_address = global_config.config.address;
+                if let Some((depth_balance, mut config_account)) =
+                    shard_accounts.get(config_address)?
+                {
+                    update_config_account(&mut config_account, &global_config.config)?;
+                    shard_accounts.set(config_address, depth_balance, config_account)?;
+                    println!("Config contract was updated!");
+                } else {
+                    anyhow::bail!("failed to reset elector account");
+                }
+
+                // let elector_address = global_config.config.get_elector_address()?;
+                // if let Some((depth_balance, mut elector_account)) =
+                //     shard_accounts.get(elector_address)?
+                // {
+                //     reset_elector_account(&mut elector_account)?;
+                //     shard_accounts.set(elector_address, depth_balance, elector_account)?;
+                //     println!("Elector contract was reset!");
+                // } else {
+                //     anyhow::bail!("failed to reset elector account");
+                // }
 
                 println!("Serializing accounts before prev_blocks...");
                 let accounts = Lazy::new(&shard_accounts)?;
@@ -89,7 +111,7 @@ pub fn migrate_state(
                     shard_state_id,
                     global_balance,
                 )
-                .context("failed to map masterchain extra")?;
+                    .context("failed to map masterchain extra")?;
                 println!("Mapped masterchain extra");
 
                 (accounts, Some(Lazy::new(&custom)?))
@@ -673,7 +695,7 @@ fn override_workchain_zerostates(
 // }
 
 fn update_config_account(
-    accounts: &mut tycho::ShardAccounts,
+    config_account: &mut tycho::ShardAccount,
     config: &tycho::BlockchainConfig,
 ) -> Result<()> {
     println!("Updating config contract data...");
@@ -681,11 +703,7 @@ fn update_config_account(
         return Err(TychoError::InvalidData.into());
     };
 
-    let Some((depth_balance, mut shard_account)) = accounts.get(config.address)? else {
-        return Ok(());
-    };
-
-    let Some(mut account) = shard_account.load_account()? else {
+    let Some(mut account) = config_account.load_account()? else {
         return Ok(());
     };
 
@@ -702,22 +720,47 @@ fn update_config_account(
 
             state.data = Some(builder.build()?);
         }
-        tycho::AccountState::Uninit | tycho::AccountState::Frozen(..) => return Ok(()),
+        _ => anyhow::bail!("invalid config state"),
     }
 
-    shard_account.account = Lazy::new(&tycho::OptionalAccount(Some(account)))?;
-    accounts.set(config.address, depth_balance, shard_account)?;
-    println!("Config contract was updated!");
-
+    config_account.account = Lazy::new(&tycho::OptionalAccount(Some(account)))?;
     Ok(())
 }
 
-// fn update_elector_account(account: &mut tycho::ShardAccount) -> Result<()> {
-//     let Some(account) = account.load_account()? else {
-//         return Err(TychoError::InvalidData.into());
-//     };
-//     account.state
-// }
+fn reset_elector_account(account: &mut tycho::ShardAccount) -> Result<()> {
+    static ELECTOR_ABI: OnceLock<AbiType> = OnceLock::new();
+
+    let Some(mut loaded_account) = account.load_account()? else {
+        return Err(TychoError::InvalidData.into());
+    };
+
+    let grams = loaded_account.balance.tokens;
+    let state = match &mut loaded_account.state {
+        AccountState::Active(state) => state,
+        _ => anyhow::bail!("invalid elector state"),
+    };
+    let elector_data = state.data.as_ref().context("elector data is empty")?;
+
+    let abi_type = ELECTOR_ABI.get_or_init(PartialElectorData::abi_type);
+    let mut elector_data = elector_data.as_slice()?;
+    let mut data = AbiValue::load_partial(abi_type, AbiVersion::V2_1, &mut elector_data)
+        .and_then(PartialElectorData::from_abi)?;
+    data.current_election = None;
+    data.past_elections = BTreeMap::new();
+    data.active_hash = HashBytes::default();
+    data.credits = BTreeMap::new();
+    data.grams = grams;
+    data.active_id = 0;
+
+    let mut builder = CellBuilder::new();
+    let elector_data_prefix = data.as_abi().make_cell(AbiVersion::V2_1)?;
+    builder.store_slice(elector_data_prefix.as_slice()?)?;
+    builder.store_slice(elector_data)?;
+    state.data = Some(builder.build()?);
+    account.account = Lazy::new(&tycho::OptionalAccount(Some(loaded_account)))?;
+
+    Ok(())
+}
 
 fn map_mc_state_extra(
     old_mc_state_extra: &OldMcStateExtra,
